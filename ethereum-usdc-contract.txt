@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title USDCPaymentProcessor
+ * @dev Smart contract for processing USDC payments on Ethereum L2 (Avalanche)
+ */
+contract USDCPaymentProcessor is ReentrancyGuard, Ownable, Pausable {
+    IERC20 public immutable usdcToken;
+    
+    // Payment structure
+    struct PaymentDetails {
+        uint256 paymentId;
+        address sender;
+        address recipient;
+        uint256 amount;
+        string businessName;
+        string customerName;
+        string orderId;
+        uint256 timestamp;
+        PaymentStatus status;
+    }
+    
+    struct BusinessConfig {
+        uint256 feeRate; // Fee rate in basis points (100 = 1%)
+        uint256 minAmount;
+        uint256 maxAmount;
+        bool isActive;
+        address feeCollector;
+    }
+    
+    enum PaymentStatus {
+        Pending,
+        Completed,
+        Failed,
+        Refunded
+    }
+    
+    // State variables
+    uint256 private _paymentCounter;
+    mapping(uint256 => PaymentDetails) private _payments;
+    mapping(address => BusinessConfig) private _businessConfigs;
+    mapping(address => bool) private _authorizedAddresses;
+    
+    // Events
+    event PaymentProcessed(
+        uint256 indexed paymentId,
+        address indexed sender,
+        address indexed recipient,
+        uint256 amount,
+        string orderId
+    );
+    
+    event BusinessConfigured(
+        address indexed businessAddress,
+        uint256 feeRate,
+        uint256 minAmount,
+        uint256 maxAmount
+    );
+    
+    event AddressAuthorized(address indexed addr, bool authorized);
+    event FeeCollected(address indexed business, uint256 amount);
+    event PaymentRefunded(uint256 indexed paymentId, uint256 amount);
+    
+    // Modifiers
+    modifier onlyAuthorized() {
+        require(_authorizedAddresses[msg.sender], "Not authorized");
+        _;
+    }
+    
+    modifier validPaymentId(uint256 paymentId) {
+        require(paymentId > 0 && paymentId <= _paymentCounter, "Invalid payment ID");
+        _;
+    }
+    
+    /**
+     * @dev Constructor
+     * @param _usdcToken Address of the USDC token contract
+     */
+    constructor(address _usdcToken) {
+        require(_usdcToken != address(0), "Invalid USDC token address");
+        usdcToken = IERC20(_usdcToken);
+    }
+    
+    /**
+     * @dev Configure business settings
+     * @param businessAddress Address of the business
+     * @param feeRate Fee rate in basis points
+     * @param minAmount Minimum payment amount
+     * @param maxAmount Maximum payment amount
+     * @param feeCollector Address to collect fees
+     */
+    function configureBusiness(
+        address businessAddress,
+        uint256 feeRate,
+        uint256 minAmount,
+        uint256 maxAmount,
+        address feeCollector
+    ) external onlyOwner {
+        require(businessAddress != address(0), "Invalid business address");
+        require(feeRate <= 1000, "Fee rate too high"); // Max 10%
+        require(minAmount <= maxAmount, "Invalid amount range");
+        require(feeCollector != address(0), "Invalid fee collector");
+        
+        _businessConfigs[businessAddress] = BusinessConfig({
+            feeRate: feeRate,
+            minAmount: minAmount,
+            maxAmount: maxAmount,
+            isActive: true,
+            feeCollector: feeCollector
+        });
+        
+        emit BusinessConfigured(businessAddress, feeRate, minAmount, maxAmount);
+    }
+    
+    /**
+     * @dev Authorize/deauthorize an address
+     * @param addr Address to authorize/deauthorize
+     * @param authorized Authorization status
+     */
+    function setAuthorizedAddress(address addr, bool authorized) external onlyOwner {
+        _authorizedAddresses[addr] = authorized;
+        emit AddressAuthorized(addr, authorized);
+    }
+    
+    /**
+     * @dev Process USDC payment
+     * @param recipient Address to receive the payment
+     * @param amount Payment amount in USDC (with 6 decimals)
+     * @param businessName Name of the business
+     * @param customerName Name of the customer
+     * @param orderId Order identifier
+     */
+    function processPayment(
+        address recipient,
+        uint256 amount,
+        string calldata businessName,
+        string calldata customerName,
+        string calldata orderId
+    ) external nonReentrant whenNotPaused returns (uint256) {
+        require(recipient != address(0), "Invalid recipient");
+        require(amount > 0, "Amount must be positive");
+        require(_authorizedAddresses[recipient], "Recipient not authorized");
+        require(bytes(businessName).length > 0, "Business name required");
+        require(bytes(orderId).length > 0, "Order ID required");
+        
+        // Validate business configuration
+        BusinessConfig memory config = _businessConfigs[recipient];
+        require(config.isActive, "Business not active");
+        require(amount >= config.minAmount, "Amount below minimum");
+        require(amount <= config.maxAmount, "Amount above maximum");
+        
+        // Check sender's USDC balance and allowance
+        require(usdcToken.balanceOf(msg.sender) >= amount, "Insufficient USDC balance");
+        require(usdcToken.allowance(msg.sender, address(this)) >= amount, "Insufficient allowance");
+        
+        // Calculate fee
+        uint256 fee = (amount * config.feeRate) / 10000;
+        uint256 netAmount = amount - fee;
+        
+        // Transfer USDC from sender to recipient
+        require(usdcToken.transferFrom(msg.sender, recipient, netAmount), "Transfer failed");
+        
+        // Transfer fee to fee collector if applicable
+        if (fee > 0) {
+            require(usdcToken.transferFrom(msg.sender, config.feeCollector, fee), "Fee transfer failed");
+            emit FeeCollected(recipient, fee);
+        }
+        
+        // Create payment record
+        uint256 paymentId = ++_paymentCounter;
+        
+        _payments[paymentId] = PaymentDetails({
+            paymentId: paymentId,
+            sender: msg.sender,
+            recipient: recipient,
+            amount: amount,
+            businessName: businessName,
+            customerName: customerName,
+            orderId: orderId,
+            timestamp: block.timestamp,
+            status: PaymentStatus.Completed
+        });
+        
+        emit PaymentProcessed(paymentId, msg.sender, recipient, amount, orderId);
+        
+        return paymentId;
+    }
+    
+    /**
+     * @dev Process batch payments
+     * @param recipients Array of recipient addresses
+     * @param amounts Array of payment amounts
+     * @param businessNames Array of business names
+     * @param customerNames Array of customer names
+     * @param orderIds Array of order IDs
+     */
+    function processBatchPayments(
+        address[] calldata recipients,
+        uint256[] calldata amounts,
+        string[] calldata businessNames,
+        string[] calldata customerNames,
+        string[] calldata orderIds
+    ) external nonReentrant whenNotPaused returns (uint256[] memory) {
+        require(recipients.length == amounts.length, "Arrays length mismatch");
+        require(recipients.length == businessNames.length, "Arrays length mismatch");
+        require(recipients.length == customerNames.length, "Arrays length mismatch");
+        require(recipients.length == orderIds.length, "Arrays length mismatch");
+        require(recipients.length <= 50, "Too many payments"); // Limit batch size
+        
+        uint256[] memory paymentIds = new uint256[](recipients.length);
+        
+        for (uint256 i = 0; i < recipients.length; i++) {
+            paymentIds[i] = processPayment(
+                recipients[i],
+                amounts[i],
+                businessNames[i],
+                customerNames[i],
+                orderIds[i]
+            );
+        }
+        
+        return paymentIds;
+    }
+    
+    /**
+     * @dev Get payment details
+     * @param paymentId Payment ID
+     */
+    function getPayment(uint256 paymentId) 
+        external 
+        view 
+        validPaymentId(paymentId) 
+        returns (PaymentDetails memory) 
+    {
+        return _payments[paymentId];
+    }
+    
+    /**
+     * @dev
